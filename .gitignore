@@ -1,0 +1,52 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物
+dist/
+dist-ssr/
+build/
+*.tsbuildinfo
+
+# 日志与缓存
+*.log
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.vite/
+.cache/
+.turbo/
+
+# 环境与密钥（.env 永不入库）
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# 编辑器 / 系统
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 测试与覆盖率
+coverage/
+playwright-report/
+test-results/
+
+# 美术资源原始工程文件：只提交运行时产物，不提交源工程
+# （Blender/Substance 源文件体积大且非运行必需）
+assets-src/
+*.blend
+*.blend1
+*.spp
+*.psd
+
+# 临时与草稿
+tmp/
+scratch/
+*.bak
