@@ -1,0 +1,686 @@
+/**
+ * three_think · 第一版样式
+ *
+ * 视觉方向：1821 年马尼拉港 —— 深海、黄铜、羊皮纸。
+ * 标题用衬线体制造年代感，正文保持无衬线以保证小字可读。
+ */
+
+:root {
+  --sea-900: #06161e;
+  --sea-850: #081d26;
+  --sea-800: #0b232e;
+  --sea-700: #103440;
+  --line: #1d4353;
+  --line-soft: #16323e;
+  --gold: #d9a441;
+  --gold-dim: #8a6a2c;
+  --cream: #ece5d5;
+  --muted: #8ba4af;
+  --danger: #e08a78;
+  --ok: #63b79f;
+
+  --font-sans: "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui,
+    -apple-system, sans-serif;
+  --font-display: "Songti SC", "Noto Serif SC", "Source Han Serif SC", Georgia, "Times New Roman",
+    serif;
+
+  --panel-width: 384px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--sea-900);
+  color: var(--cream);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--panel-width);
+}
+
+.stage {
+  position: relative;
+  min-width: 0;
+  height: 100%;
+}
+
+.stage canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* ------------------------------------------------------------------ HUD */
+
+.hud {
+  position: fixed;
+  top: 14px;
+  left: 14px;
+  z-index: 5;
+  display: grid;
+  gap: 2px;
+  padding: 10px 12px;
+  min-width: 148px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: rgba(6, 22, 30, 0.74);
+  backdrop-filter: blur(6px);
+  font-size: 12px;
+  line-height: 1.7;
+  pointer-events: none;
+}
+
+.hud__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.hud__row span {
+  color: var(--muted);
+}
+
+.hud__row strong {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.hud__row strong.is-over {
+  color: var(--danger);
+}
+
+.hud__row--muted strong {
+  color: var(--muted);
+}
+
+/* ----------------------------------------------------------- 侧栏面板 */
+
+.panel {
+  position: relative;
+  z-index: 4;
+  height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 20px 20px 28px;
+  border-left: 1px solid var(--line);
+  background: linear-gradient(180deg, var(--sea-800), var(--sea-850));
+}
+
+.panel__head {
+  border-bottom: 1px solid var(--line-soft);
+  padding-bottom: 12px;
+}
+
+.panel__eyebrow {
+  margin: 0 0 4px;
+  font-size: 12px;
+  letter-spacing: 0.16em;
+  color: var(--gold-dim);
+}
+
+.panel__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 21px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.section-title {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+}
+
+/* ------------------------------------------------------------- 竞标区 */
+
+.auction {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(9, 32, 41, 0.72);
+}
+
+.auction.is-closed {
+  opacity: 0.72;
+}
+
+.auction__row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.auction__label {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.auction__value,
+.auction__turn {
+  font-size: 16px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.auction__turn {
+  color: var(--gold);
+}
+
+.auction__controls {
+  display: grid;
+  gap: 10px;
+}
+
+.bid-input {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.bid-input input {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--sea-900);
+  color: var(--cream);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.bid-input input:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 1px;
+}
+
+.bid-quick {
+  display: flex;
+  gap: 6px;
+}
+
+.bid-quick button {
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--sea-700);
+  color: var(--cream);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.bid-quick button:hover {
+  border-color: var(--gold-dim);
+}
+
+.auction__buttons {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.btn {
+  padding: 11px 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--sea-700);
+  color: var(--cream);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, transform 60ms ease;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--gold-dim);
+  background: #14404e;
+}
+
+.btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.btn--primary {
+  border-color: var(--gold-dim);
+  background: linear-gradient(180deg, #c8952f, #a97a22);
+  color: #1b1204;
+}
+
+.btn--primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, #dda444, #b8862a);
+}
+
+.btn--wide {
+  width: 100%;
+}
+
+.auction__hint,
+.auction__error {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.auction__error {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(224, 138, 120, 0.4);
+  background: rgba(224, 138, 120, 0.12);
+  color: var(--danger);
+}
+
+/* --------------------------------------------------------------- 结果 */
+
+.result {
+  display: grid;
+  gap: 6px;
+  padding: 16px;
+  border: 1px solid var(--gold-dim);
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(217, 164, 65, 0.14), rgba(217, 164, 65, 0.04));
+}
+
+.result__eyebrow {
+  margin: 0;
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  color: var(--gold-dim);
+}
+
+.result__name {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--gold);
+}
+
+.result__detail,
+.result__next {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--cream);
+}
+
+.result__next {
+  padding-top: 8px;
+  border-top: 1px dashed rgba(217, 164, 65, 0.3);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* --------------------------------------------------------------- 玩家 */
+
+.player-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+.player {
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: rgba(9, 32, 41, 0.5);
+}
+
+.player.is-turn {
+  border-color: var(--gold-dim);
+  background: rgba(217, 164, 65, 0.08);
+}
+
+.player__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.player__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.player__name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.player__cash {
+  margin-left: auto;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  color: var(--gold);
+}
+
+.player__meta,
+.player__tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 7px;
+}
+
+.player__credit {
+  margin: 7px 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.shares {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.tag {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--sea-700);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--cream);
+  white-space: nowrap;
+}
+
+.tag--share {
+  border-color: #2b5a4b;
+  background: rgba(99, 183, 159, 0.14);
+  color: #a9ddcb;
+}
+
+.tag--mortgaged {
+  border-color: #6b4326;
+  background: rgba(217, 164, 65, 0.1);
+  color: #d7b071;
+}
+
+.tag--master {
+  border-color: var(--gold-dim);
+  background: rgba(217, 164, 65, 0.18);
+  color: var(--gold);
+}
+
+.tag--passed {
+  border-color: #4a4a4a;
+  background: rgba(140, 140, 140, 0.12);
+  color: var(--muted);
+}
+
+.tag--turn {
+  border-color: #2f6b7e;
+  background: rgba(95, 179, 202, 0.16);
+  color: #9fd4e4;
+}
+
+.tag--muted {
+  color: var(--muted);
+}
+
+/* --------------------------------------------------------------- 日志 */
+
+.log-list {
+  margin: 0;
+  padding: 0 0 0 4px;
+  list-style: none;
+  max-height: 190px;
+  overflow-y: auto;
+  display: grid;
+  gap: 5px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.log-list li {
+  padding-left: 10px;
+  border-left: 2px solid var(--line-soft);
+}
+
+.log-list li:last-child {
+  border-left-color: var(--gold-dim);
+  color: var(--cream);
+}
+
+/* --------------------------------------------------------------- 规则 */
+
+.rules {
+  border-top: 1px solid var(--line-soft);
+  padding-top: 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.rules summary {
+  cursor: pointer;
+  color: var(--gold-dim);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+}
+
+.rules ul {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 5px;
+  line-height: 1.7;
+}
+
+.rules strong {
+  color: var(--cream);
+}
+
+/* ----------------------------------------------------------- 开始界面 */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: radial-gradient(circle at 30% 20%, rgba(16, 52, 64, 0.94), rgba(6, 22, 30, 0.98));
+  backdrop-filter: blur(3px);
+  overflow-y: auto;
+}
+
+.overlay__card {
+  width: min(560px, 100%);
+  padding: 32px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: linear-gradient(180deg, var(--sea-800), var(--sea-850));
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+}
+
+.overlay__eyebrow {
+  margin: 0 0 6px;
+  font-size: 12px;
+  letter-spacing: 0.22em;
+  color: var(--gold-dim);
+}
+
+.overlay__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 46px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--gold);
+}
+
+.overlay__subtitle {
+  margin: 12px 0 0;
+  font-size: 14px;
+  line-height: 1.8;
+  color: var(--muted);
+}
+
+.overlay__section {
+  margin-top: 26px;
+}
+
+.overlay__label {
+  margin: 0 0 10px;
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+}
+
+.count-picker {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.count-picker__option {
+  padding: 12px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--sea-700);
+  color: var(--cream);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.count-picker__option:hover {
+  border-color: var(--gold-dim);
+}
+
+.count-picker__option.is-active {
+  border-color: var(--gold);
+  background: rgba(217, 164, 65, 0.16);
+  color: var(--gold);
+}
+
+.overlay__note {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.name-list {
+  display: grid;
+  gap: 8px;
+}
+
+.name-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 10px;
+}
+
+.name-row__dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+
+.name-row__dot--1 { background: #d9a441; }
+.name-row__dot--2 { background: #4aa39a; }
+.name-row__dot--3 { background: #c4614f; }
+.name-row__dot--4 { background: #6f83c9; }
+.name-row__dot--5 { background: #9a6fbd; }
+
+.name-row input {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--sea-900);
+  color: var(--cream);
+  font: inherit;
+  font-size: 14px;
+}
+
+.name-row input:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 1px;
+}
+
+.overlay__card .btn--wide {
+  margin-top: 28px;
+  padding: 14px;
+  font-size: 16px;
+}
+
+.overlay__footnote {
+  margin: 16px 0 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--muted);
+  text-align: center;
+}
+
+/* --------------------------------------------------------------- 窄屏 */
+
+@media (max-width: 900px) {
+  #app {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  .panel {
+    height: auto;
+    max-height: 58vh;
+    border-left: none;
+    border-top: 1px solid var(--line);
+    padding: 16px 16px 22px;
+  }
+
+  .hud {
+    top: 10px;
+    left: 10px;
+    font-size: 11px;
+  }
+
+  .log-list {
+    max-height: 120px;
+  }
+
+  .overlay__card {
+    padding: 24px 20px;
+  }
+
+  .overlay__title {
+    font-size: 36px;
+  }
+}
