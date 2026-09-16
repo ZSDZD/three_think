@@ -29,6 +29,8 @@ export interface SceneHandle {
   readonly controls: OrbitControls;
   readonly canvas: HTMLCanvasElement;
   onStats(callback: (stats: RenderStats) => void): void;
+  /** 每帧回调，参数为距上一帧的秒数（供船只补间等使用） */
+  onFrame(callback: (deltaSeconds: number) => void): void;
   dispose(): void;
 }
 
@@ -145,6 +147,7 @@ export function createScene(container: HTMLElement): SceneHandle {
   // ---------------------------------------------------------------- 循环
 
   let statsCallback: ((stats: RenderStats) => void) | null = null;
+  let frameCallback: ((deltaSeconds: number) => void) | null = null;
   let fps = 0;
   let lastTime = performance.now();
   let lastReport = 0;
@@ -168,10 +171,12 @@ export function createScene(container: HTMLElement): SceneHandle {
   resize();
 
   renderer.setAnimationLoop((time) => {
-    const delta = time - lastTime;
+    const deltaMs = time - lastTime;
     lastTime = time;
-    if (delta > 0) fps = fps === 0 ? 1000 / delta : fps * 0.9 + (1000 / delta) * 0.1;
+    const deltaSeconds = Math.min(deltaMs / 1000, 0.1);
+    if (deltaMs > 0) fps = fps === 0 ? 1000 / deltaMs : fps * 0.9 + (1000 / deltaMs) * 0.1;
 
+    frameCallback?.(deltaSeconds);
     controls.update();
     renderer.render(scene, camera);
 
@@ -194,6 +199,9 @@ export function createScene(container: HTMLElement): SceneHandle {
     canvas,
     onStats(callback) {
       statsCallback = callback;
+    },
+    onFrame(callback) {
+      frameCallback = callback;
     },
     dispose() {
       renderer.setAnimationLoop(null);
