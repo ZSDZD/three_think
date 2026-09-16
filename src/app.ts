@@ -4,12 +4,14 @@
  * 分层的粘合点就在这里 —— 它是唯一同时认识三层的文件，
  * 而 core / render / ui 三者之间互不依赖（agent.md §3）。
  */
+import { GOODS } from './config/board-layout';
 import { applyIntent, createGame, startVoyage, type GameState, type Intent } from './core/game';
+import { createAccomplices } from './render/accomplices';
 import { createBoard } from './render/board';
 import { installDevHook } from './render/dev-hook';
 import { disposeLabelTextures } from './render/labels';
 import { createScene } from './render/scene';
-import { createBiddingPanel, type BiddingPanelHandle } from './ui/bidding-panel';
+import { createGamePanel, type GamePanelHandle } from './ui/game-panel';
 import { createHud } from './ui/hud';
 import { createStartScreen } from './ui/start-screen';
 
@@ -24,9 +26,15 @@ export function bootApp(root: HTMLElement): void {
   const board = createBoard();
   scene.scene.add(board.group);
 
+  const accomplices = createAccomplices();
+  scene.scene.add(accomplices.group);
+
+  // 船只移动补间
+  scene.onFrame((delta) => board.update(delta));
+
   // 仅开发环境：暴露取景检测，供浏览器验证脚本断言棋盘未被截断
   if (import.meta.env.DEV) {
-    installDevHook(scene.camera, scene.renderer);
+    installDevHook(scene.scene, scene.camera, scene.renderer);
   }
 
   const hud = createHud();
@@ -34,17 +42,30 @@ export function bootApp(root: HTMLElement): void {
   scene.onStats((stats) => hud.update(stats));
 
   let state: GameState | null = null;
-  let panel: BiddingPanelHandle | null = null;
+  let panel: GamePanelHandle | null = null;
+
+  /** 把 core 的状态同步到画面 */
+  function syncView(next: GameState, immediate = false): void {
+    board.syncBoats(next.boats, immediate);
+
+    next.players.forEach((player) => void player);
+    accomplices.sync(next.placements, next.players, board, next.boats);
+
+    // 价格标记：GOODS 的下标与价格轨的行一一对应
+    GOODS.forEach((good, index) => {
+      board.setPriceIndex(index, next.priceIndex[good.id] ?? 0);
+    });
+  }
 
   function handleIntent(intent: Intent): void {
     if (!state || !panel) return;
     const outcome = applyIntent(state, intent);
     if (!outcome.ok) {
-      // 规则层拒绝：把原因显示出来，状态保持不变
       panel.render(state, outcome.error.message);
       return;
     }
     state = outcome.state;
+    syncView(state, intent.type === 'master-launch' || intent.type === 'master-load');
     panel.render(state, null);
   }
 
@@ -52,12 +73,13 @@ export function bootApp(root: HTMLElement): void {
     onStart(playerCount, names) {
       startScreen.dispose();
 
-      // 种子写进对局记录，便于复现（agent.md §5）
       const seed = Math.floor(Math.random() * 1_000_000);
       hud.setSeed(seed);
 
       state = startVoyage(createGame({ playerCount, names, seed }));
-      panel = createBiddingPanel({ onIntent: handleIntent });
+      syncView(state, true);
+
+      panel = createGamePanel({ onIntent: handleIntent });
       root.appendChild(panel.element);
       panel.render(state, null);
     },
@@ -65,10 +87,11 @@ export function bootApp(root: HTMLElement): void {
 
   root.appendChild(startScreen.element);
 
-  // 页面卸载时释放贴图，避免显存泄漏
+  // 页面卸载时释放贴图与材质，避免显存泄漏
   window.addEventListener(
     'beforeunload',
     () => {
+      accomplices.dispose();
       board.dispose();
       disposeLabelTextures();
       scene.dispose();

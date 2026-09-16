@@ -11,11 +11,14 @@ import * as THREE from 'three';
 import {
   GOODS,
   LANE_COUNT,
+  LANE_LAST_SPACE,
   LANE_SPACES,
   PORT_SLOTS,
   PRICE_TRACK,
   SHIPYARD_SLOTS,
+  getWareLoad,
 } from '../config/board-layout';
+import type { BoatState, SpotRef } from '../core/voyage';
 import { createBoat } from './boat';
 import {
   BOARD_CENTER,
@@ -41,17 +44,28 @@ import { PALETTE, goldMaterial, standardMaterial } from './palette';
 import { createLaneStripTexture, createPriceTrackTexture } from './textures';
 
 /** 船的缩放：船体原长在 1.6 世界单位左右，缩到略大于一个航道格 */
-const BOAT_SCALE = 0.85;
+export const BOAT_SCALE = 0.85;
 
 /** 船停在水面上的高度 */
 const BOAT_Y = 0.09;
 
 export interface BoardView {
   readonly group: THREE.Group;
-  /** 把第 index 艘船放到指定航道的指定格 */
+  /** 把第 index 艘船放到指定航道的指定格（瞬时） */
   placeBoat(index: number, lane: number, space: number): void;
+  /** 按对局状态同步三艘船的位置（默认补间） */
+  syncBoats(boats: readonly BoatState[], immediate?: boolean): void;
+  /** 某格位在世界中的位置（供拾取代理与调试使用） */
+  spotPosition(spot: SpotRef, boats: readonly BoatState[]): THREE.Vector3;
+  /**
+   * 某格位的挂载点：货仓格位挂在船体上（随船一起动），其余挂在棋盘根节点。
+   * 返回的 position 是相对 parent 的局部坐标。
+   */
+  spotAnchor(spot: SpotRef, boats0: readonly BoatState[]): { parent: THREE.Object3D; position: THREE.Vector3 };
   /** 把第 goodIndex 种货物的价格标记移到价格轨第 step 档 */
   setPriceIndex(goodIndex: number, step: number): void;
+  /** 每帧推进船只补间 */
+  update(deltaSeconds: number): void;
   dispose(): void;
 }
 
@@ -342,14 +356,118 @@ export function createBoard(): BoardView {
     group.add(boat.group);
   }
 
+  /** 船的移动补间目标；null 表示已到位 */
+  const boatTargets: (THREE.Vector3 | null)[] = boats.map(() => null);
+
+  /** 某艘船在某状态下应有的世界位置 */
+  function boatPositionOf(index: number, boats0: readonly BoatState[]): THREE.Vector3 {
+    const state = boats0[index];
+    // 已进港 / 已进船厂的船停到对应的空格上
+    if (state?.arrivedSlot !== null && state?.arrivedSlot !== undefined) {
+      const p = portSlotPosition(state.arrivedSlot);
+      return new THREE.Vector3(p.x, BOAT_Y, p.z);
+    }
+    if (state?.shipyardSlot !== null && state?.shipyardSlot !== undefined) {
+      const p = shipyardSlotPosition(state.shipyardSlot);
+      return new THREE.Vector3(p.x, BOAT_Y, p.z);
+    }
+    const lane = state?.lane ?? index;
+    const space = Math.min(state?.position ?? 0, LANE_LAST_SPACE);
+    return new THREE.Vector3(laneX(lane), BOAT_Y, -space * SPACE_PITCH);
+  }
+
+  /** 货仓格位在船体局部坐标系里的偏移（船身纵向排开，避免小弟重叠） */
+  function holdLocalOffset(spot: Extract<SpotRef, { kind: 'hold' }>, boats0: readonly BoatState[]): THREE.Vector3 {
+    const good = boats0[spot.boat]?.good ?? null;
+    const count = good ? getWareLoad(good).spaces.length : 3;
+    const dz = ((spot.space - (count - 1) / 2) * 0.24) / BOAT_SCALE;
+    return new THREE.Vector3(0, 0.34 / BOAT_SCALE, dz);
+  }
+
+  /** 非货仓格位在世界中的位置 */
+  function staticSpotPosition(spot: SpotRef): THREE.Vector3 {
+    switch (spot.kind) {
+      case 'port': {
+        const p = portSlotPosition(spot.slot);
+        return new THREE.Vector3(p.x, 0.46, p.z);
+      }
+      case 'shipyard': {
+        const p = shipyardSlotPosition(spot.slot);
+        return new THREE.Vector3(p.x, 0.38, p.z);
+      }
+      case 'pirate':
+        return new THREE.Vector3(
+          SIDE_BLOCKS.pirate.x + (spot.space === 0 ? -0.45 : 0.45),
+          0.42,
+          SIDE_BLOCKS.pirate.z,
+        );
+      case 'pilot':
+        return new THREE.Vector3(
+          SIDE_BLOCKS.pilot.x + (spot.size === 'small' ? -0.42 : 0.42),
+          0.3,
+          SIDE_BLOCKS.pilot.z,
+        );
+      case 'insurance':
+        return new THREE.Vector3(SIDE_BLOCKS.insurance.x, 0.8, SIDE_BLOCKS.insurance.z);
+      case 'hold':
+        return new THREE.Vector3();
+    }
+  }
+
   const view: BoardView = {
     group,
 
     placeBoat(index, lane, space) {
       const boat = boats[index];
       if (!boat) return;
-      const p = { x: laneX(lane), z: -space * SPACE_PITCH };
-      boat.group.position.set(p.x, BOAT_Y, p.z);
+      boat.group.position.set(laneX(lane), BOAT_Y, -space * SPACE_PITCH);
+      boatTargets[index] = null;
+    },
+
+    syncBoats(next, immediate = false) {
+      next.forEach((_, index) => {
+        const target = boatPositionOf(index, next);
+        if (immediate) {
+          boats[index]?.group.position.copy(target);
+          boatTargets[index] = null;
+        } else {
+          boatTargets[index] = target;
+        }
+      });
+    },
+
+    spotPosition(spot, boats0) {
+      if (spot.kind === 'hold') {
+        const group0 = boats[spot.boat]?.group;
+        const base = group0 ? group0.position.clone() : new THREE.Vector3();
+        base.add(holdLocalOffset(spot, boats0).multiplyScalar(BOAT_SCALE));
+        return base;
+      }
+      return staticSpotPosition(spot);
+    },
+
+    spotAnchor(spot, boats0) {
+      if (spot.kind === 'hold') {
+        const boatGroup = boats[spot.boat]?.group;
+        if (boatGroup) {
+          return { parent: boatGroup, position: holdLocalOffset(spot, boats0) };
+        }
+      }
+      return { parent: group, position: staticSpotPosition(spot) };
+    },
+
+    /** 每帧推进船只补间 */
+    update(deltaSeconds) {
+      const k = Math.min(1, deltaSeconds * 6);
+      boats.forEach((boat, index) => {
+        const target = boatTargets[index];
+        if (!target) return;
+        boat.group.position.lerp(target, k);
+        if (boat.group.position.distanceToSquared(target) < 1e-4) {
+          boat.group.position.copy(target);
+          boatTargets[index] = null;
+        }
+      });
     },
 
     setPriceIndex(goodIndex, step) {

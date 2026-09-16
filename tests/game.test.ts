@@ -62,7 +62,7 @@ describe('股份价格', () => {
 });
 
 describe('竞标结算', () => {
-  it('得标者付款入钱箱、成为港务长，阶段推进到 auction-settled', () => {
+  it('得标者付款入钱箱、成为港务长，阶段推进到买股份', () => {
     let state = startGame(3);
     // 顺序 p1 → p2 → p3
     state = ok(applyIntent(state, { type: 'auction-bid', playerId: 'p1', amount: 5 }));
@@ -70,7 +70,7 @@ describe('竞标结算', () => {
     state = ok(applyIntent(state, { type: 'auction-pass', playerId: 'p3' }));
     state = ok(applyIntent(state, { type: 'auction-pass', playerId: 'p1' }));
 
-    expect(state.phase).toBe('auction-settled');
+    expect(state.phase).toBe('buy-share');
     expect(state.harborMaster).toBe('p2');
     expect(state.bidding?.paid).toBe(8);
 
@@ -88,7 +88,7 @@ describe('竞标结算', () => {
 
     const bad = applyIntent(state, { type: 'auction-bid', playerId: 'p1', amount: 9 });
     expect(bad.ok).toBe(false);
-    if (!bad.ok) expect(bad.error.code).toBe('wrong-phase');
+    if (!bad.ok) expect(bad.error.code).toBe('wrong-intent');
   });
 
   it('现金不足时自动抵押股份贷款补足', () => {

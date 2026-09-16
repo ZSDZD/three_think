@@ -3,61 +3,150 @@
  *
  * 分层要求（agent.md §3）：本文件属于 core/，**不得 import three.js**。
  *
- * 联机预留（用户已确认「本地热座为主，架构预留联机接口」）：
- * 状态推进只通过 applyIntent(state, intent) —— 意图是纯数据，可序列化。
- * 将来加联机时，对端只需要把 Intent 发过来，不需要改动规则层。
+ * 联机预留：状态推进只通过 applyIntent(state, intent) —— 意图是纯数据，可序列化。
+ * 随机性通过 (seed, rngCounter) 派生，同一 seed + 同一串意图必然复现同一局。
+ *
+ * 完整航程流程（每段航程四步，规则见 config 与 docs/game-flow.md）：
+ *   竞标港务长 → 买股份 → 装货 → 放船
+ *   → 放置小弟 / 掷骰推船 交替（含海盗登船、领航员）
+ *   → 海盗去向 → 利润分配 → 货物涨价 → 下一段航程
+ *   任一货物价格达到 30 元 → 游戏结束，财富最高者胜。
  */
-import { GOODS, PRICE_TRACK } from '../config/board-layout';
+import {
+  GOODS,
+  LANE_LAST_SPACE,
+  PRICE_TRACK,
+  PRINTED_VALUES_PROVENANCE,
+} from '../config/board-layout';
 import {
   ACCOMPLICES_BY_PLAYER_COUNT,
+  GAME_END_PRICE,
   MAX_PLAYERS,
   MIN_PLAYERS,
   MIN_SHARE_PRICE,
-  MORTGAGE_LOAN,
   STARTING_CASH,
   STARTING_SHARES,
 } from '../config/constants';
 import {
   applyBiddingAction,
   createBidding,
+  type BiddingAction,
   type BiddingEvent,
   type BiddingState,
-  type BiddingAction,
 } from './bidding';
-import { createRng, shuffle } from './rng';
+import { payToBank } from './economy';
+import { fail, ok, sharePriceAt, skippedGoodOf, validateLaunch, validateLoad } from './master';
+import {
+  applyPilotMoves,
+  boardPirates,
+  boatsOnThirteen,
+  hasPirate,
+  nextFreePortSlot,
+  nextFreeShipyardSlot,
+  piratesInOrder,
+  plunderBoat,
+  resolveEndOfVoyage,
+  rollDice,
+  advanceBoats,
+  type PilotMove,
+} from './movement';
+import { settleVoyage, type PayoutReport } from './payout';
+import {
+  applyPlacement,
+  cheapestEmptyHoldSpace,
+  placedCount,
+  placementOrder,
+  type PlacementContext,
+} from './placement';
+import { createRng, shuffle, splitSeed } from './rng';
 import { findPlayer, type GoodId, type Player, type PlayerId, type ShareCard } from './types';
+import {
+  createBoats,
+  spotKey,
+  type BoatState,
+  type DiceRoll,
+  type Placement,
+  type PilotSize,
+  type SpotRef,
+  type VoyageStep,
+  voyageSchedule,
+} from './voyage';
+
+// ---------------------------------------------------------------- 阶段
 
 export type GamePhase =
-  /** 还没开局 */
   | 'setup'
-  /** 竞标进行中 */
   | 'auction'
-  /** 本段航程的竞标已结算（第一版到此为止，后续阶段待实现） */
-  | 'auction-settled';
+  | 'buy-share'
+  | 'load'
+  | 'launch'
+  | 'placement'
+  | 'movement'
+  | 'pilot'
+  | 'pirate-destination'
+  | 'payout'
+  | 'price-rise'
+  | 'game-over';
 
 export interface GameState {
   readonly phase: GamePhase;
-  /** 随机种子，写进对局记录以便复现 */
+  /** 随机主种子，写进对局记录以便复现 */
   readonly seed: number;
+  /** 取随机数的次数；与 seed 一起派生每次随机 */
+  readonly rngCounter: number;
   /** 航程序号，从 1 开始 */
   readonly voyage: number;
   readonly players: readonly Player[];
+  /** 尚未被买走的股份（港务长每航程可买 1 张） */
+  readonly sharePool: readonly ShareCard[];
   readonly bidding: BiddingState | null;
-  /** 当前港务长；null 表示本段航程尚未产生 */
   readonly harborMaster: PlayerId | null;
   /** 各货物在黑市价格轨上的下标 */
   readonly priceIndex: Readonly<Record<GoodId, number>>;
+  readonly boats: readonly BoatState[];
+  readonly placements: readonly Placement[];
+  /** 本航程的步骤表（放置 / 移动 / 领航员） */
+  readonly schedule: readonly VoyageStep[];
+  readonly stepIndex: number;
+  /** 当前放置回合内已放置过的玩家 */
+  readonly actedThisRound: readonly PlayerId[];
+  /** 本段航程已自我克制（不再放小弟）的玩家 */
+  readonly declined: readonly PlayerId[];
+  /** 本航程没装船的那种货 */
+  readonly skippedGood: GoodId | null;
+  readonly dice: readonly DiceRoll[] | null;
+  /** 海盗船的船长（第一个占据海盗第一格的人），负责决定被劫掠船只去向 */
+  readonly pirateCaptain: PlayerId | null;
+  /** 待决定去向的被劫掠船只下标 */
+  readonly piratePending: readonly number[];
+  /** 领航员阶段：还没行动的领航员（先小后大） */
+  readonly pilotPending: readonly PilotSize[];
+  readonly payout: PayoutReport | null;
   /** 面向玩家的中文事件日志 */
   readonly log: readonly string[];
+  readonly winner: PlayerId | null;
 }
 
-/**
- * 玩家意图 —— 唯一允许驱动状态变化的东西。
- * 将来联机时，网络上传输的就是这个类型。
- */
+// ---------------------------------------------------------------- 意图
+
 export type Intent =
   | { readonly type: 'auction-bid'; readonly playerId: PlayerId; readonly amount: number }
-  | { readonly type: 'auction-pass'; readonly playerId: PlayerId };
+  | { readonly type: 'auction-pass'; readonly playerId: PlayerId }
+  | { readonly type: 'master-buy-share'; readonly playerId: PlayerId; readonly good: GoodId }
+  | { readonly type: 'master-skip-share'; readonly playerId: PlayerId }
+  | { readonly type: 'master-load'; readonly playerId: PlayerId; readonly laneAssignment: readonly GoodId[] }
+  | { readonly type: 'master-launch'; readonly playerId: PlayerId; readonly positions: readonly number[] }
+  | { readonly type: 'place'; readonly playerId: PlayerId; readonly spot: SpotRef }
+  | { readonly type: 'decline-placement'; readonly playerId: PlayerId }
+  | { readonly type: 'pilot-move'; readonly playerId: PlayerId; readonly moves: readonly PilotMove[] }
+  | { readonly type: 'pilot-skip'; readonly playerId: PlayerId }
+  | {
+      readonly type: 'pirate-destination';
+      readonly playerId: PlayerId;
+      readonly boat: number;
+      readonly destination: 'port' | 'shipyard';
+    }
+  | { readonly type: 'advance' };
 
 export interface IntentError {
   readonly code: string;
@@ -68,7 +157,7 @@ export type IntentOutcome =
   | { readonly ok: true; readonly state: GameState; readonly events: readonly BiddingEvent[] }
   | { readonly ok: false; readonly error: IntentError };
 
-/** 五色玩家标识，前 3/4/5 个分别用于 3/4/5 人局 */
+/** 五色玩家标识 */
 const PLAYER_COLORS = ['#d9a441', '#4aa39a', '#c4614f', '#6f83c9', '#9a6fbd'] as const;
 
 export interface CreateGameOptions {
@@ -77,7 +166,8 @@ export interface CreateGameOptions {
   readonly seed?: number;
 }
 
-/** 建局：发钱、发股份、发小弟。第一版不发牌（20 张行动牌未纳入 v1）。 */
+// ---------------------------------------------------------------- 建局
+
 export function createGame(options: CreateGameOptions): GameState {
   const { playerCount } = options;
   if (!Number.isInteger(playerCount) || playerCount < MIN_PLAYERS || playerCount > MAX_PLAYERS) {
@@ -88,19 +178,34 @@ export function createGame(options: CreateGameOptions): GameState {
   const rng = createRng(seed);
   const accomplices = ACCOMPLICES_BY_PLAYER_COUNT[playerCount] ?? 3;
 
-  // 规则：从 20 张股份中每种各拿 3 张（共 12 张）洗牌，每位玩家得到两张，牌面向下。
-  const deck: ShareCard[] = [];
+  // 全部 20 张股份（每种 5 张）
+  const allShares: ShareCard[] = [];
   for (const good of GOODS) {
-    for (let copy = 0; copy < 3; copy += 1) {
-      deck.push({ id: `${good.id}-${copy + 1}`, good: good.id, mortgaged: false });
+    for (let copy = 0; copy < 5; copy += 1) {
+      allShares.push({ id: `${good.id}-${copy + 1}`, good: good.id, mortgaged: false });
     }
   }
-  const shuffled = shuffle(deck, rng);
+
+  // 规则：每种各拿 3 张（共 12 张）洗牌，每位玩家得 2 张；其余放在游戏台旁
+  const dealDeck = shuffle(
+    allShares.filter((s) => {
+      const idx = Number(s.id.split('-')[1] ?? '0');
+      return idx <= 3;
+    }),
+    rng,
+  );
+
+  const dealt: ShareCard[] = [];
   const hands: ShareCard[][] = Array.from({ length: playerCount }, () => []);
-  shuffled.forEach((card, i) => {
-    const hand = hands[i % playerCount];
-    if (hand && hand.length < STARTING_SHARES) hand.push(card);
-  });
+  for (const card of dealDeck) {
+    const target = hands.find((h) => h.length < STARTING_SHARES);
+    if (!target) break;
+    target.push(card);
+    dealt.push(card);
+  }
+
+  const dealtIds = new Set(dealt.map((c) => c.id));
+  const sharePool = allShares.filter((c) => !dealtIds.has(c.id));
 
   const players: Player[] = hands.map((shares, i) => ({
     id: `p${i + 1}`,
@@ -116,25 +221,36 @@ export function createGame(options: CreateGameOptions): GameState {
   return {
     phase: 'setup',
     seed,
+    rngCounter: 0,
     voyage: 1,
     players,
+    sharePool,
     bidding: null,
     harborMaster: null,
     priceIndex,
+    boats: createBoats(),
+    placements: [],
+    schedule: [],
+    stepIndex: 0,
+    actedThisRound: [],
+    declined: [],
+    skippedGood: null,
+    dice: null,
+    pirateCaptain: null,
+    piratePending: [],
+    pilotPending: [],
+    payout: null,
     log: [
       `${playerCount} 人局开始，每人 ${STARTING_CASH} 元披索、${accomplices} 个小弟、${STARTING_SHARES} 张股份。`,
+      ...(PRINTED_VALUES_PROVENANCE === 'placeholder'
+        ? ['⚠ 棋盘印刷数值为推定占位值，结算结果不代表原版游戏（见 docs/design-v1.md §5）。']
+        : []),
     ],
+    winner: null,
   };
 }
 
-/**
- * 开始一段航程的竞标。
- *
- * 起叫者规则：「在第一段航程中，最老的玩家开始竞标…在接下来的航程中，
- * 由前一个回合拥有海港负责人的玩家开始竞标。」
- *
- * 简化：数字版无法得知年龄，第一段航程固定由**座位第 1 位**起叫。见 docs/design-v1.md。
- */
+/** 开始一段航程的竞标 */
 export function startVoyage(state: GameState): GameState {
   const order = state.players.map((p) => p.id);
   const incumbent = state.harborMaster;
@@ -148,30 +264,146 @@ export function startVoyage(state: GameState): GameState {
     ...state,
     phase: 'auction',
     bidding,
+    boats: createBoats(),
+    placements: [],
+    schedule: [],
+    stepIndex: 0,
+    actedThisRound: [],
+    declined: [],
+    skippedGood: null,
+    dice: null,
+    pirateCaptain: null,
+    piratePending: [],
+    pilotPending: [],
+    payout: null,
+    harborMaster: null,
     log: [
       ...state.log,
-      `第 ${state.voyage} 段航程：竞标港务长办事处，由 ${starterName} 起叫，起拍价 1 元。`,
+      `── 第 ${state.voyage} 段航程 ──`,
+      `竞标港务长办事处，由 ${starterName} 起叫，起拍价 1 元。`,
     ],
   };
 }
 
-/** 货物当前单价（股份价值）。规则：股份最低价永远为 5 元。 */
+/** 货物当前单价（股份价值） */
 export function sharePrice(state: GameState, good: GoodId): number {
-  const idx = state.priceIndex[good] ?? 0;
-  return Math.max(MIN_SHARE_PRICE, PRICE_TRACK[idx] ?? MIN_SHARE_PRICE);
+  return Math.max(MIN_SHARE_PRICE, PRICE_TRACK[state.priceIndex[good] ?? 0] ?? MIN_SHARE_PRICE);
 }
 
-/**
- * 应用一个意图。
- *
- * 这是**唯一**允许改变对局状态的入口 —— 纯函数，便于测试、回放和将来的联机同步。
- */
+export function playerCreditLimit(player: Player): number {
+  return player.cash + player.shares.filter((s) => !s.mortgaged).length * 12;
+}
+
+/** 玩家总财富：现金 + 股份价值 − 每张抵押股份 15 元 */
+export function wealthOf(state: GameState, player: Player): number {
+  const sharesValue = player.shares.reduce((sum, s) => sum + sharePrice(state, s.good), 0);
+  const mortgaged = player.shares.filter((s) => s.mortgaged).length;
+  return player.cash + sharesValue - mortgaged * 15;
+}
+
+// ---------------------------------------------------------------- 查询helper（供 UI 用）
+
+export function placementContext(state: GameState): PlacementContext {
+  return { boats: state.boats, placements: state.placements, players: state.players };
+}
+
+/** 当前该放小弟的玩家；本回合所有人都放完了则返回 null */
+export function currentPlacementPlayer(state: GameState): PlayerId | null {
+  if (state.phase !== 'placement') return null;
+  const master = state.harborMaster;
+  if (!master) return null;
+  const ctx = placementContext(state);
+
+  for (const id of placementOrder(state.players, master, state.declined)) {
+    if (state.actedThisRound.includes(id)) continue;
+    const player = findPlayer(state.players, id);
+    if (!player) continue;
+    if (placedCount(ctx, id) >= player.accomplicesTotal) continue;
+    return id;
+  }
+  return null;
+}
+
+/** 当前该行动的领航员持有者 */
+export function currentPilot(state: GameState): { size: PilotSize; playerId: PlayerId } | null {
+  if (state.phase !== 'pilot') return null;
+  for (let i = 0; i < state.pilotPending.length; i += 1) {
+    const size = state.pilotPending[i];
+    if (!size) continue;
+    const holder = state.placements.find((p) => p.spot.kind === 'pilot' && p.spot.size === size);
+    if (holder) return { size, playerId: holder.playerId };
+  }
+  return null;
+}
+
+/** 当前该决定被劫掠船只去向的海盗船长 */
+export function currentPirateDecider(state: GameState): PlayerId | null {
+  if (state.phase !== 'pirate-destination') return null;
+  return state.pirateCaptain;
+}
+
+/** 有效的最低出价（竞标阶段） */
+export function currentAuctionPlayer(state: GameState): PlayerId | null {
+  if (state.phase !== 'auction' || !state.bidding) return null;
+  if (state.bidding.status !== 'open') return null;
+  return state.bidding.order[state.bidding.cursor] ?? null;
+}
+
+// ---------------------------------------------------------------- 随机
+
+function nextRng(state: GameState): { rng: ReturnType<typeof createRng>; counter: number } {
+  const counter = state.rngCounter + 1;
+  return { rng: createRng(splitSeed(state.seed, counter)), counter };
+}
+
+// ---------------------------------------------------------------- 意图分发
+
 export function applyIntent(state: GameState, intent: Intent): IntentOutcome {
-  if (state.phase !== 'auction' || state.bidding === null) {
-    return {
-      ok: false,
-      error: { code: 'wrong-phase', message: '当前不在竞标阶段。' },
-    };
+  switch (state.phase) {
+    case 'auction':
+      return handleAuction(state, intent);
+    case 'buy-share':
+      return handleBuyShare(state, intent);
+    case 'load':
+      return handleLoad(state, intent);
+    case 'launch':
+      return handleLaunch(state, intent);
+    case 'placement':
+      return handlePlacement(state, intent);
+    case 'movement':
+      return handleMovementAdvance(state, intent);
+    case 'pilot':
+      return handlePilot(state, intent);
+    case 'pirate-destination':
+      return handlePirateDestination(state, intent);
+    case 'payout':
+      return handlePayoutAdvance(state, intent);
+    case 'price-rise':
+      return handlePriceRiseAdvance(state, intent);
+    default:
+      return err('wrong-phase', `当前阶段（${state.phase}）不接受任何操作。`);
+  }
+}
+
+function err(code: string, message: string): IntentOutcome {
+  return { ok: false, error: { code, message } };
+}
+
+function okState(state: GameState, events: readonly BiddingEvent[] = []): IntentOutcome {
+  return { ok: true, state, events };
+}
+
+function withLog(state: GameState, lines: readonly string[]): GameState {
+  if (lines.length === 0) return state;
+  return { ...state, log: [...state.log, ...lines] };
+}
+
+// ---------------------------------------------------------------- 竞标
+
+function handleAuction(state: GameState, intent: Intent): IntentOutcome {
+  if (!state.bidding) return err('wrong-phase', '竞标尚未开始。');
+  if (intent.type !== 'auction-bid' && intent.type !== 'auction-pass') {
+    return err('wrong-intent', '竞标阶段只能出价或过牌。');
   }
 
   const action: BiddingAction =
@@ -180,90 +412,33 @@ export function applyIntent(state: GameState, intent: Intent): IntentOutcome {
       : { type: 'pass', playerId: intent.playerId };
 
   const outcome = applyBiddingAction(state.bidding, state.players, action);
-  if (!outcome.ok) {
-    return { ok: false, error: { code: outcome.error.code, message: outcome.error.message } };
-  }
+  if (!outcome.ok) return err(outcome.error.code, outcome.error.message);
 
-  const log = [...state.log, ...outcome.events.map((e) => describeEvent(state, e))];
-  const settled = outcome.state.status !== 'open';
-
-  if (!settled) {
-    return { ok: true, state: { ...state, bidding: outcome.state, log }, events: outcome.events };
-  }
-
-  // 竞标结算：得标者付款入钱箱，成为港务长
-  const winner = outcome.state.winner;
-  let players = state.players;
-  if (winner !== null && outcome.state.paid > 0) {
-    const settledPayment = payToBank(state, players, winner, outcome.state.paid);
-    players = settledPayment.players;
-    log.push(...settledPayment.notes);
-  }
-
-  return {
-    ok: true,
-    state: {
-      ...state,
-      phase: 'auction-settled',
-      players,
-      bidding: outcome.state,
-      harborMaster: winner,
-      log,
-    },
-    events: outcome.events,
+  let next: GameState = {
+    ...state,
+    bidding: outcome.state,
+    log: [...state.log, ...outcome.events.map((e) => describeEvent(state, e))],
   };
-}
 
-/**
- * 得标者把成交价付给海港钱箱。
- *
- * 规则：「当玩家必须付钱而他没有足够的现金，他必须贷款」——
- * 现金不足时自动抵押股份（每张贷 MORTGAGE_LOAN 元）。
- * 简化：自动挑选**当前单价最低**的未抵押股份先抵押；原版允许玩家自行选择哪一张。
- */
-function payToBank(
-  state: GameState,
-  players: readonly Player[],
-  payerId: PlayerId,
-  amount: number,
-): { players: Player[]; notes: string[] } {
-  const notes: string[] = [];
-  const idx = players.findIndex((p) => p.id === payerId);
-  const payer = players[idx];
-  if (!payer || idx < 0) return { players: [...players], notes };
+  if (outcome.state.status === 'open') return okState(next, outcome.events);
 
-  let cash = payer.cash;
-  let shares = [...payer.shares];
-  let raised = 0;
-
-  if (cash < amount) {
-    const need = amount - cash;
-    const mortgageOrder = shares
-      .map((share, i) => ({ share, i }))
-      .filter(({ share }) => !share.mortgaged)
-      .sort((a, b) => sharePrice(state, a.share.good) - sharePrice(state, b.share.good));
-
-    for (const { i } of mortgageOrder) {
-      if (raised >= need) break;
-      const card = shares[i];
-      if (!card || card.mortgaged) continue;
-      shares[i] = { ...card, mortgaged: true };
-      raised += MORTGAGE_LOAN;
-      notes.push(
-        `${payer.name} 现金不足，抵押 1 张「${goodName(card.good)}」股份贷款 ${MORTGAGE_LOAN} 元。`,
-      );
+  // 竞标结算：得标者付款，成为港务长
+  const winner = outcome.state.winner;
+  if (winner && outcome.state.paid > 0) {
+    const idx = next.players.findIndex((p) => p.id === winner);
+    const payer = next.players[idx];
+    if (payer) {
+      const paid = payToBank(payer, outcome.state.paid, (g) => sharePrice(next, g));
+      const players = [...next.players];
+      players[idx] = paid.player;
+      next = { ...next, players };
+      if (paid.note) next = withLog(next, [paid.note]);
     }
-    cash += raised;
   }
 
-  const updated: Player = { ...payer, cash: cash - amount, shares };
-  const next = [...players];
-  next[idx] = updated;
-  return { players: next, notes };
-}
-
-function goodName(good: GoodId): string {
-  return GOODS.find((g) => g.id === good)?.name ?? good;
+  const masterName = winner ? (findPlayer(next.players, winner)?.name ?? winner) : '（无）';
+  next = withLog(next, [`${masterName} 就任第 ${state.voyage} 段航程的港务长。`]);
+  return okState({ ...next, phase: 'buy-share', harborMaster: winner }, outcome.events);
 }
 
 function describeEvent(state: GameState, event: BiddingEvent): string {
@@ -274,7 +449,7 @@ function describeEvent(state: GameState, event: BiddingEvent): string {
     case 'pass':
       return `${name(event.playerId)} 过牌，退出本段航程竞标。`;
     case 'won':
-      return `${name(event.playerId)} 以 ${event.amount} 元得标，成为第 ${state.voyage} 段航程的港务长。`;
+      return `${name(event.playerId)} 以 ${event.amount} 元得标。`;
     case 'incumbent-holds':
       return `无人出价，${name(event.playerId)} 连任港务长。`;
     case 'no-bid-default':
@@ -282,8 +457,507 @@ function describeEvent(state: GameState, event: BiddingEvent): string {
   }
 }
 
-/** 供 UI 使用：某个玩家的信用额度 */
-export function playerCreditLimit(player: Player): number {
-  const unmortgaged = player.shares.filter((s) => !s.mortgaged).length;
-  return player.cash + unmortgaged * MORTGAGE_LOAN;
+// ---------------------------------------------------------------- 港务长：买股份
+
+function handleBuyShare(state: GameState, intent: Intent): IntentOutcome {
+  const master = state.harborMaster;
+  if (!master) return err('no-master', '没有港务长。');
+  if (intent.type !== 'master-buy-share' && intent.type !== 'master-skip-share') {
+    return err('wrong-intent', '现在只能买股份或跳过。');
+  }
+  if (intent.playerId !== master) return err('not-your-turn', '只有港务长可以买股份。');
+
+  if (intent.type === 'master-skip-share') {
+    return okState(withLog({ ...state, phase: 'load' }, ['港务长放弃购买股份。']));
+  }
+
+  const player = findPlayer(state.players, master);
+  if (!player) return err('unknown-player', '找不到港务长。');
+
+  const cardIndex = state.sharePool.findIndex((c) => c.good === intent.good);
+  if (cardIndex < 0) return err('no-share', `钱箱里已经没有「${intent.good}」的股份了。`);
+
+  const cost = sharePriceAt(state.priceIndex[intent.good] ?? 0);
+  const affordable = playerCreditLimit(player) >= cost;
+  if (!affordable) {
+    return err('cannot-afford', `股份要 ${cost} 元，现金加可贷款额度不足。`);
+  }
+
+  const card = state.sharePool[cardIndex];
+  if (!card) return err('no-share', '股份不存在。');
+
+  const paid = payToBank(player, cost, (g) => sharePrice(state, g));
+  const players = state.players.map((p) =>
+    p.id === master ? { ...paid.player, shares: [...paid.player.shares, card] } : p,
+  );
+  const pool = state.sharePool.filter((_, i) => i !== cardIndex);
+
+  let next: GameState = {
+    ...state,
+    phase: 'load',
+    players,
+    sharePool: pool,
+    log: [
+      ...state.log,
+      `港务长 ${player.name} 以 ${cost} 元买入 1 张「${goodLabel(intent.good)}」股份。`,
+    ],
+  };
+  if (paid.note) next = withLog(next, [paid.note]);
+  return okState(next);
 }
+
+function goodLabel(good: GoodId): string {
+  return GOODS.find((g) => g.id === good)?.name ?? good;
+}
+
+// ---------------------------------------------------------------- 港务长：装货
+
+function handleLoad(state: GameState, intent: Intent): IntentOutcome {
+  const master = state.harborMaster;
+  if (!master) return err('no-master', '没有港务长。');
+  if (intent.type !== 'master-load') return err('wrong-intent', '现在只能装货。');
+  if (intent.playerId !== master) return err('not-your-turn', '只有港务长可以装货。');
+
+  const check = validateLoad(intent.laneAssignment);
+  if (!check.ok) return err('invalid-load', check.message);
+
+  const boats: BoatState[] = state.boats.map((boat, lane) => ({
+    ...boat,
+    good: intent.laneAssignment[lane] ?? null,
+    position: 0,
+    arrivedSlot: null,
+    shipyardSlot: null,
+    plundered: false,
+  }));
+
+  const skipped = skippedGoodOf(intent.laneAssignment);
+  const lines = intent.laneAssignment.map(
+    (good, lane) => `第 ${lane + 1} 航道装上「${goodLabel(good)}」。`,
+  );
+  if (skipped) lines.push(`本航程不装载「${goodLabel(skipped)}」。`);
+
+  return okState(
+    withLog({ ...state, phase: 'launch', boats, skippedGood: skipped }, lines),
+  );
+}
+
+// ---------------------------------------------------------------- 港务长：放船
+
+function handleLaunch(state: GameState, intent: Intent): IntentOutcome {
+  const master = state.harborMaster;
+  if (!master) return err('no-master', '没有港务长。');
+  if (intent.type !== 'master-launch') return err('wrong-intent', '现在只能放船。');
+  if (intent.playerId !== master) return err('not-your-turn', '只有港务长可以放船。');
+
+  const check = validateLaunch(intent.positions);
+  if (!check.ok) return err('invalid-launch', check.message);
+
+  const boats = state.boats.map((boat, lane) => ({ ...boat, position: intent.positions[lane] ?? 0 }));
+  const lines = [
+    `平底船入海：${intent.positions.map((p, i) => `第 ${i + 1} 航道从第 ${p} 格`).join('、')}。（起点之和 ${intent.positions.reduce((a, b) => a + b, 0)}）`,
+  ];
+
+  const schedule = voyageSchedule(state.players.length);
+  const next: GameState = {
+    ...state,
+    boats,
+    schedule,
+    stepIndex: 0,
+    actedThisRound: [],
+    declined: [],
+    pilotPending: [],
+    log: [...state.log, ...lines],
+  };
+  return okState(enterStep(next));
+}
+
+// ---------------------------------------------------------------- 步骤推进
+
+/**
+ * 进入当前 stepIndex 指向的步骤。
+ * - placement：等待玩家逐个放小弟
+ * - pilot：等待领航员行动
+ * - movement：立即掷骰 + 推船 + 处理海盗触发，然后等待「继续」
+ */
+function enterStep(state: GameState): GameState {
+  const step = state.schedule[state.stepIndex];
+
+  if (step === undefined) {
+    return finishVoyage(state);
+  }
+
+  switch (step) {
+    case 'placement':
+      return withLog({ ...state, phase: 'placement', actedThisRound: [] }, [
+        `放置小弟（第 ${state.schedule.slice(0, state.stepIndex + 1).filter((s) => s === 'placement').length} 轮）。`,
+      ]);
+
+    case 'pilot': {
+      const pending: PilotSize[] = [];
+      for (const size of ['small', 'large'] as const) {
+        if (state.placements.some((p) => p.spot.kind === 'pilot' && p.spot.size === size)) {
+          pending.push(size);
+        }
+      }
+      if (pending.length === 0) {
+        return enterStep({ ...state, stepIndex: state.stepIndex + 1 });
+      }
+      return withLog({ ...state, phase: 'pilot', pilotPending: pending }, ['领航员阶段。']);
+    }
+
+    case 'movement':
+      return runMovement(state);
+  }
+}
+
+/** 掷骰、推船、处理海盗触发 */
+function runMovement(state: GameState): GameState {
+  const { rng, counter } = nextRng(state);
+  const dice = rollDice(state.boats, rng);
+  const round = state.schedule.slice(0, state.stepIndex + 1).filter((s) => s === 'movement').length;
+
+  const diceLine = `第 ${round} 次移动：掷骰 ${dice.map((d) => `${goodLabel(d.good)} ${d.pips}`).join('、')}。`;
+  const moved = advanceBoats(state.boats, dice);
+
+  let next: GameState = {
+    ...state,
+    phase: 'movement',
+    rngCounter: counter,
+    dice,
+    boats: moved.boats,
+    log: [...state.log, diceLine, ...moved.notes],
+  };
+
+  // 海盗触发：移动回合结束时恰好停在第 13 格的船
+  const onThirteen = boatsOnThirteen(next.boats);
+  if (onThirteen.length > 0 && hasPirate(next.placements)) {
+    for (const boatIndex of onThirteen) {
+      if (round >= 3) {
+        const result = plunderBoat(next.boats, boatIndex);
+        next = withLog({ ...next, boats: result.boats }, result.notes);
+      } else {
+        const result = boardPirates(next.boats, next.placements, boatIndex);
+        next = withLog({ ...next, boats: result.boats, placements: result.placements }, result.notes);
+      }
+    }
+  } else if (onThirteen.length > 0) {
+    next = withLog(next, ['有船停在第 13 格，但海盗船上没有人。']);
+  }
+
+  return next;
+}
+
+function handleMovementAdvance(state: GameState, intent: Intent): IntentOutcome {
+  if (intent.type !== 'advance') return err('wrong-intent', '移动阶段只能点「继续」。');
+  return okState(enterStep({ ...state, stepIndex: state.stepIndex + 1 }));
+}
+
+// ---------------------------------------------------------------- 放置小弟
+
+function handlePlacement(state: GameState, intent: Intent): IntentOutcome {
+  if (intent.type !== 'place' && intent.type !== 'decline-placement') {
+    return err('wrong-intent', '放置阶段只能放小弟或自我克制。');
+  }
+
+  const expected = currentPlacementPlayer(state);
+  if (expected !== intent.playerId) {
+    const name = expected ? (findPlayer(state.players, expected)?.name ?? expected) : '（无人）';
+    return err('not-your-turn', `现在轮到 ${name}。`);
+  }
+
+  if (intent.type === 'decline-placement') {
+    const player = findPlayer(state.players, intent.playerId);
+    let next = withLog(
+      {
+        ...state,
+        declined: [...state.declined, intent.playerId],
+        actedThisRound: [...state.actedThisRound, intent.playerId],
+      },
+      [`${player?.name ?? intent.playerId} 自我克制，本段航程不再放置小弟。`],
+    );
+    next = maybeAdvancePlacement(next);
+    return okState(next);
+  }
+
+  const ctx = placementContext(state);
+  const outcome = applyPlacement(ctx, intent.playerId, intent.spot);
+  if (!outcome.ok) return err(outcome.error.code, outcome.error.message);
+
+  const placement = outcome.placement;
+  const player = findPlayer(state.players, intent.playerId);
+  const lines = [...outcome.notes];
+
+  // 付放置费；保险处反而立即拿钱
+  let players = state.players;
+  if (player) {
+    if (placement.spot.kind === 'insurance') {
+      players = state.players.map((p) =>
+        p.id === player.id ? { ...p, cash: p.cash + 10 } : p,
+      );
+      lines.push(`${player.name} 担任保险仲介者，立即从钱箱取得 10 元。`);
+    } else if (placement.cost > 0) {
+      lines.push(`${player.name} 付出放置费 ${placement.cost} 元。`);
+    }
+  }
+
+  const isCaptainSeat = placement.spot.kind === 'pirate' && placement.spot.space === 0;
+  const pirateCaptain = isCaptainSeat ? player?.id ?? state.pirateCaptain : state.pirateCaptain;
+
+  let next: GameState = {
+    ...state,
+    players,
+    placements: [...state.placements, placement],
+    actedThisRound: [...state.actedThisRound, intent.playerId],
+    pirateCaptain,
+    log: [...state.log, ...lines],
+  };
+
+  next = maybeAdvancePlacement(next);
+  return okState(next);
+}
+
+/** 本回合所有人都放完了（或自我克制了）就进入下一步骤 */
+function maybeAdvancePlacement(state: GameState): GameState {
+  if (currentPlacementPlayer(state) !== null) return state;
+  return enterStep({ ...state, stepIndex: state.stepIndex + 1 });
+}
+
+// ---------------------------------------------------------------- 领航员
+
+function handlePilot(state: GameState, intent: Intent): IntentOutcome {
+  if (intent.type !== 'pilot-move' && intent.type !== 'pilot-skip') {
+    return err('wrong-intent', '领航员阶段只能移动船只或放弃。');
+  }
+
+  const current = currentPilot(state);
+  if (!current) {
+    // 剩下的领航员都没人担任 → 直接跳过
+    return okState(skipRestOfPilot(state, []));
+  }
+  if (intent.playerId !== current.playerId) {
+    const name = findPlayer(state.players, current.playerId)?.name ?? current.playerId;
+    return err('not-your-turn', `现在轮到 ${name} 的领航员。`);
+  }
+
+  const lines: string[] = [];
+  let boats = state.boats;
+
+  if (intent.type === 'pilot-move') {
+    const check = validatePilotMoves(current.size, intent.moves, state.boats);
+    if (!check.ok) return err('invalid-pilot', check.message);
+    if (intent.moves.length > 0) {
+      const result = applyPilotMoves(state.boats, intent.moves);
+      boats = result.boats;
+      lines.push(...result.notes);
+    } else {
+      lines.push('领航员放弃了他的影响力。');
+    }
+  } else {
+    lines.push('领航员放弃了他的影响力。');
+  }
+
+  const remaining = state.pilotPending.filter((s) => s !== current.size);
+  let next: GameState = { ...state, boats, pilotPending: remaining, log: [...state.log, ...lines] };
+
+  if (currentPilot(next) === null) {
+    // 剩下的领航员位子没人 → 一并跳过，然后进入最后一步
+    next = skipRestOfPilot(next, []);
+    return okState(enterStep({ ...next, stepIndex: next.stepIndex + 1 }));
+  }
+  return okState(next);
+}
+
+function skipRestOfPilot(state: GameState, lines: string[]): GameState {
+  return { ...state, pilotPending: [], log: [...state.log, ...lines] };
+}
+
+/** 领航员影响力的合法性：小领航员最多 1 格；大领航员要么一艘 2 格，要么两艘各 1 格 */
+export function validatePilotMoves(
+  size: PilotSize,
+  moves: readonly PilotMove[],
+  boats: readonly BoatState[],
+): { ok: true } | { ok: false; message: string } {
+  if (moves.some((m) => !boats[m.boat])) return fail('目标船只不存在。');
+  if (moves.some((m) => boats[m.boat]?.arrivedSlot !== null || boats[m.boat]?.shipyardSlot !== null)) {
+    return fail('领航员无法影响已经抵达或已进船厂的平底船。');
+  }
+  const total = moves.reduce((sum, m) => sum + Math.abs(m.delta), 0);
+  if (moves.some((m) => !Number.isInteger(m.delta))) return fail('移动格数必须是整数。');
+
+  if (size === 'small') {
+    if (moves.length > 1) return fail('小领航员只能移动一艘船。');
+    if (total > 1) return fail('小领航员只能移动一格。');
+    return ok();
+  }
+
+  if (moves.length > 2) return fail('大领航员最多移动两艘船。');
+  if (moves.length === 2) {
+    if (total > 2 || moves.some((m) => Math.abs(m.delta) > 1)) {
+      return fail('大领航员移动两艘船时，每艘只能移动一格。');
+    }
+    return ok();
+  }
+  if (total > 2) return fail('大领航员最多移动两格。');
+  return ok();
+}
+
+// ---------------------------------------------------------------- 海盗去向
+
+function handlePirateDestination(state: GameState, intent: Intent): IntentOutcome {
+  if (intent.type !== 'pirate-destination') return err('wrong-intent', '海盗船长需要为被劫掠的船决定去向。');
+  if (!state.pirateCaptain) return err('no-captain', '没有海盗船长。');
+  if (intent.playerId !== state.pirateCaptain) {
+    return err('not-your-turn', '只有海盗船长可以决定被劫掠船只的去向。');
+  }
+  if (!state.piratePending.includes(intent.boat)) {
+    return err('not-pending', '这艘船不需要决定去向。');
+  }
+
+  const boat = state.boats[intent.boat];
+  if (!boat) return err('unknown-boat', '找不到这艘船。');
+
+  let slot: number | null;
+  let boats: BoatState[];
+  if (intent.destination === 'port') {
+    slot = nextFreePortSlot(state.boats);
+    if (slot === null) return err('no-slot', '港口空格已满。');
+    boats = state.boats.map((b, i) => (i === intent.boat ? { ...b, arrivedSlot: slot } : b));
+  } else {
+    slot = nextFreeShipyardSlot(state.boats);
+    if (slot === null) return err('no-slot', '修船场空格已满。');
+    boats = state.boats.map((b, i) => (i === intent.boat ? { ...b, shipyardSlot: slot } : b));
+  }
+
+  const letter = 'ABC'[slot] ?? '?';
+  const lines = [
+    `海盗船长把第 ${boat.lane + 1} 航道的被劫掠船只送往${
+      intent.destination === 'port' ? `港口空格 ${letter}（该货物涨价）` : `修船场空格 ${letter}`
+    }。`,
+  ];
+
+  const pending = state.piratePending.filter((b) => b !== intent.boat);
+  let next: GameState = { ...state, boats, piratePending: pending, log: [...state.log, ...lines] };
+
+  if (pending.length === 0) next = beginPayout(next);
+  return okState(next);
+}
+
+// ---------------------------------------------------------------- 航程收尾
+
+/** 最后一步移动之后：船难判定 → 海盗去向 → 结算 */
+function finishVoyage(state: GameState): GameState {
+  const resolved = resolveEndOfVoyage(state.boats, state.placements);
+  let next = withLog({ ...state, boats: resolved.boats }, resolved.notes);
+
+  const pending: number[] = [];
+  next.boats.forEach((boat, i) => {
+    if (boat.plundered && boat.arrivedSlot === null && boat.shipyardSlot === null) pending.push(i);
+  });
+
+  if (pending.length > 0) {
+    const captainName = next.pirateCaptain
+      ? (findPlayer(next.players, next.pirateCaptain)?.name ?? next.pirateCaptain)
+      : '（无人）';
+    next = withLog({ ...next, phase: 'pirate-destination', piratePending: pending }, [
+      `被劫掠的船只需决定去向，由海盗船长 ${captainName} 决定。`,
+    ]);
+    return next;
+  }
+
+  return beginPayout(next);
+}
+
+function beginPayout(state: GameState): GameState {
+  const { players, report } = settleVoyage({
+    boats: state.boats,
+    placements: state.placements,
+    players: state.players,
+    priceOf: (good) => sharePrice(state, good),
+    nameOf: (id) => findPlayer(state.players, id)?.name ?? id,
+  });
+
+  return withLog({ ...state, phase: 'payout', players, payout: report, piratePending: [] }, [
+    '── 利润分配 ──',
+    ...report.notes,
+  ]);
+}
+
+function handlePayoutAdvance(state: GameState, intent: Intent): IntentOutcome {
+  if (intent.type !== 'advance') return err('wrong-intent', '结算阶段只能点「继续」。');
+  const arrived = state.payout?.goodArrived ?? [];
+
+  const priceIndex = { ...state.priceIndex };
+  const lines: string[] = [];
+  for (const good of new Set(arrived)) {
+    const current = priceIndex[good] ?? 0;
+    const nextIndex = Math.min(current + 1, PRICE_TRACK.length - 1);
+    priceIndex[good] = nextIndex;
+    lines.push(
+      `「${goodLabel(good)}」价格上升到 ${PRICE_TRACK[nextIndex] ?? 0} 元。`,
+    );
+  }
+  if (arrived.length === 0) lines.push('本航程没有货物抵达港口，价格不变。');
+
+  return okState(
+    withLog({ ...state, phase: 'price-rise', priceIndex }, ['── 货物价格上升 ──', ...lines]),
+  );
+}
+
+function handlePriceRiseAdvance(state: GameState, intent: Intent): IntentOutcome {
+  if (intent.type !== 'advance') return err('wrong-intent', '涨价阶段只能点「继续」。');
+
+  const reachEnd = GOODS.some(
+    (g) => (PRICE_TRACK[state.priceIndex[g.id] ?? 0] ?? 0) >= GAME_END_PRICE,
+  );
+
+  if (reachEnd) {
+    const ranked = [...state.players].sort((a, b) => wealthOf(state, b) - wealthOf(state, a));
+    const winner = ranked[0]?.id ?? null;
+    const lines = [
+      '── 游戏结束 ──',
+      '有货物价格达到 30 元，游戏结束。',
+      ...ranked.map(
+        (p, i) => `第 ${i + 1} 名：${p.name}，财富 ${wealthOf(state, p)} 元（现金 ${p.cash}）。`,
+      ),
+      winner ? `${findPlayer(state.players, winner)?.name ?? winner} 成为马尼拉最成功的商人。` : '',
+    ].filter((l) => l.length > 0);
+    return okState(withLog({ ...state, phase: 'game-over', winner }, lines));
+  }
+
+  const nextVoyage: GameState = {
+    ...state,
+    voyage: state.voyage + 1,
+    log: [...state.log, '── 本段航程结束，回收所有小弟与平底船 ──'],
+  };
+  return okState(startVoyage(nextVoyage));
+}
+
+/** 供 UI 显示：当前航程第几次移动 */
+export function movementRoundOf(state: GameState): number {
+  return state.schedule.slice(0, state.stepIndex + 1).filter((s) => s === 'movement').length;
+}
+
+/** 供 UI 显示：航道终点常量 */
+export const LAST_SPACE = LANE_LAST_SPACE;
+
+/** 供 UI 显示：某船货仓最低空位 */
+export function cheapestHoldSpace(state: GameState, boatIndex: number): number | null {
+  return cheapestEmptyHoldSpace(placementContext(state), boatIndex);
+}
+
+/** 供 UI 显示：海盗船长 */
+export function pirateCaptainOf(state: GameState): PlayerId | null {
+  return state.pirateCaptain;
+}
+
+/** 供 UI 显示：海盗顺序（用于展示） */
+export function pirateOrder(state: GameState): readonly Placement[] {
+  return piratesInOrder(state.placements);
+}
+
+/** 某格位是否已被占用 */
+export function isSpotTaken(state: GameState, spot: SpotRef): boolean {
+  return state.placements.some((p) => spotKey(p.spot) === spotKey(spot));
+}
+
+export { skippedGoodOf };

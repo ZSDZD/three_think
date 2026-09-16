@@ -19,6 +19,7 @@ export interface FramingReport {
 }
 
 export function installDevHook(
+  scene: THREE.Scene,
   camera: THREE.PerspectiveCamera,
   renderer: THREE.WebGLRenderer,
 ): void {
@@ -61,5 +62,17 @@ export function installDevHook(
       calls: renderer.info.render.calls,
       triangles: renderer.info.render.triangles,
     }),
+    /** 场景对象统计，用于验证小弟棋子等确实被挂上去了 */
+    sceneInfo: () => {
+      let objects = 0;
+      let meshes = 0;
+      let accompliceMeshes = 0;
+      scene.traverse((obj) => {
+        objects += 1;
+        if ((obj as THREE.Mesh).isMesh) meshes += 1;
+        if (obj.userData['accomplice'] === true) accompliceMeshes += 1;
+      });
+      return { objects, meshes, accompliceMeshes };
+    },
   };
 }
