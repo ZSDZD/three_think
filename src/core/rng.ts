@@ -41,3 +41,17 @@ export function shuffle<T>(items: readonly T[], rng: Rng): T[] {
   }
   return out;
 }
+
+/**
+ * 从主种子与一个递增计数器派生出新的种子。
+ *
+ * 用途：状态机是纯函数，不能持有 rng 实例。把「第几次取随机数」记进状态，
+ * 每次需要随机时用 (seed, counter) 派生一个独立的 rng。
+ * 这样同一份 seed + 同一串意图，必然得到同一局游戏（agent.md §5 的确定性要求）。
+ */
+export function splitSeed(seed: number, counter: number): number {
+  let h = (seed ^ 0x9e3779b9) >>> 0;
+  h = Math.imul(h ^ counter, 0x85ebca6b) >>> 0;
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35) >>> 0;
+  return (h ^ (h >>> 16)) >>> 0;
+}
