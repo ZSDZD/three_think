@@ -11,8 +11,8 @@
 | 项 | 值 |
 | --- | --- |
 | 本地仓库 | 已初始化，默认分支 `main` |
-| GitHub 远端 | **未配置**（首次推送前需 `git remote add origin <URL>`） |
-| 可见性 | 公开（public） |
+| GitHub 远端 | `origin` → <https://github.com/fenghuangyuan1412/three_think> |
+| 可见性 | 公开（public）—— 内容一推送即可被全网看到，删除文件不能挽回 |
 | 当前提交规范 | 约定式提交（Conventional Commits）+ 中文主题 |
 
 ---
